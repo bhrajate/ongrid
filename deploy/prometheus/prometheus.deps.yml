@@ -1,0 +1,26 @@
+# deps-only Prometheus config（配合 deploy/docker-compose.deps.yml）。
+#
+# 与 prometheus.yml 唯一区别：ongrid-manager 抓取目标从 `ongrid:9100`
+# 改为 `host.docker.internal:9100`——因为原生开发时 ongrid 主程序跑在宿主机上，
+# 容器内的 Prometheus 需经 host-gateway 反向抓取它的进程指标。
+#
+# remote_write receiver 由 docker-compose.deps.yml 的命令行参数开启，
+# 本文件只配置 self-scrape + 抓取 ongrid manager。
+
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    metrics_path: /prometheus/metrics
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'ongrid-manager'
+    static_configs:
+      - targets: ['host.docker.internal:9100']
+    scrape_interval: 15s
+
+  # frontier 没有自暴露 /metrics（singchia/frontier:v1.2.4 暂未开），等上游加了再来。
+  # 宿主机指标经 edge → tunnel push → remote_write（ADR-014 Phase-B）。

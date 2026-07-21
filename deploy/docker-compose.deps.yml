@@ -1,0 +1,190 @@
+# ongrid 依赖服务栈（deps-only）——仅用于「宿主机原生跑 ongrid 主程序 + Docker 跑依赖」的本地开发。
+#
+# 用法：
+#   docker compose -f deploy/docker-compose.deps.yml -p ongrid-deps up -d
+#   set -a; source deploy/ongrid.local.env; set +a
+#   make run-ongrid
+#
+# 设计要点：
+#   * 只含 ongrid 主程序依赖的 8 个服务；不含 ongrid / nginx 本身。
+#   * 与生产形态 deploy/docker-compose.yml 完全隔离：容器名带 -dev 后缀、
+#     独立命名卷（*_data_dev）、建议用独立 project 名 `-p ongrid-deps`。
+#   * 所有端口只绑 127.0.0.1，宿主机上的 ongrid 能连，外部/局域网连不到。
+#   * prometheus 反向抓取宿主机上的 ongrid /metrics，走 host.docker.internal:9100
+#     （见 prometheus.deps.yml），故去掉了原文件里 `depends_on: ongrid`。
+#
+# 注意：SearXNG 的地址没有 env 开关，ongrid 首启会把 http://searxng:8080 写进
+# system_settings。原生跑时请在「设置 → Web 搜索」里把 SearXNG URL 改成
+# http://localhost:8080，否则 web_search 连不上。
+
+services:
+  mysql:
+    image: docker.cnb.cool/ongridio/ongrid/mysql:8.0
+    container_name: ongrid-mysql-dev
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: ongrid
+      MYSQL_USER: ongrid
+      MYSQL_PASSWORD: ongrid
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql_data_dev:/var/lib/mysql
+    ports:
+      # 宿主机 3307 → 容器 3306。用 3307 是为了避开宿主机上已有的原生 MySQL（占 3306）。
+      - "127.0.0.1:3307:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -prootpw"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    networks:
+      - ongrid_net
+
+  qdrant:
+    image: docker.cnb.cool/ongridio/ongrid/qdrant:v1.11.3
+    container_name: ongrid-qdrant-dev
+    restart: unless-stopped
+    volumes:
+      - qdrant_data_dev:/qdrant/storage
+    ports:
+      - "127.0.0.1:6333:6333"
+    networks:
+      - ongrid_net
+
+  frontier:
+    # 上游 broker（ADR-007）。servicebound 40011 供宿主机上的 manager 拨入；
+    # edgebound 40012 供 edge 拨入。两者都暴露到 127.0.0.1。
+    image: docker.cnb.cool/ongridio/ongrid/frontier:v1.2.4
+    container_name: ongrid-frontier-dev
+    restart: unless-stopped
+    volumes:
+      - ./install/frontier.yaml:/usr/conf/frontier.yaml:ro
+    ports:
+      - "127.0.0.1:40011:40011"
+      - "127.0.0.1:40012:40012"
+    networks:
+      - ongrid_net
+
+  prometheus:
+    # ADR-009：cloud 侧 Prometheus。remote_write 接收端 + PromQL 查询后端。
+    # deps 版挂 prometheus.deps.yml，把 ongrid-manager 抓取目标指向
+    # host.docker.internal:9100（宿主机上的 ongrid）。
+    image: docker.cnb.cool/ongridio/ongrid/prometheus:v2.54.0
+    container_name: ongrid-prometheus-dev
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=90d
+      - --storage.tsdb.retention.size=20GB
+      - --web.enable-remote-write-receiver
+      - --web.enable-lifecycle
+      - --web.external-url=/prometheus/
+      - --web.route-prefix=/prometheus/
+    extra_hosts:
+      - "host.docker.internal:${ONGRID_HOST_GATEWAY:-host-gateway}"
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - prometheus_data_dev:/prometheus
+      - ./prometheus/prometheus.deps.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - ongrid_net
+
+  loki:
+    # ADR-012。单二进制日志后端。原生跑时 ongrid 直连 localhost:3100。
+    image: docker.cnb.cool/ongridio/ongrid/loki:3.4.0
+    container_name: ongrid-loki-dev
+    restart: unless-stopped
+    command:
+      - -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - loki_data_dev:/loki
+      - ./install/loki-config.yaml:/etc/loki/local-config.yaml:ro
+    ports:
+      - "127.0.0.1:3100:3100"
+    networks:
+      - ongrid_net
+
+  tempo:
+    # ADR-013。单二进制 trace 后端。3200 = 查询 API；4318 = OTLP HTTP 接收端，
+    # ongrid 自身 OTel（ONGRID_OTEL_ENDPOINT）往这里推 span。
+    image: docker.cnb.cool/ongridio/ongrid/tempo:2.10.0
+    container_name: ongrid-tempo-dev
+    restart: unless-stopped
+    command:
+      - -config.file=/etc/tempo/tempo.yaml
+    volumes:
+      - tempo_data_dev:/var/tempo
+      - ./install/tempo-config.yaml:/etc/tempo/tempo.yaml:ro
+    ports:
+      - "127.0.0.1:3200:3200"
+      - "127.0.0.1:4318:4318"
+    depends_on:
+      - prometheus
+    networks:
+      - ongrid_net
+
+  searxng:
+    # manager web_search skill 的默认后端。仅 docker 内部 8080；原生跑时
+    # 暴露到 127.0.0.1:8080，并需在设置页把 SearXNG URL 改成 localhost（见顶部注释）。
+    image: docker.cnb.cool/ongridio/ongrid/searxng:latest
+    container_name: ongrid-searxng-dev
+    restart: unless-stopped
+    environment:
+      SEARXNG_BASE_URL: http://localhost:8080/
+      INSTANCE_NAME: ongrid-search
+    volumes:
+      - ./searxng:/etc/searxng:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      - ongrid_net
+
+  grafana:
+    image: docker.cnb.cool/ongridio/ongrid/grafana-oss:11.1.4
+    container_name: ongrid-grafana-dev
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    environment:
+      GF_SERVER_ROOT_URL: ${ONGRID_GRAFANA_ROOT_URL:-%(protocol)s://%(domain)s/grafana/}
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Editor
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: system
+      GF_USERS_DEFAULT_LANGUAGE: en-US
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      # grafana 容器内部通过 compose 网络访问 loki/tempo，仍用服务名。
+      ONGRID_LOG_URL: ${ONGRID_LOG_URL:-http://loki:3100}
+      ONGRID_TRACE_QUERY_URL: ${ONGRID_GRAFANA_TRACE_URL:-http://tempo:3200}
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - grafana_data_dev:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    networks:
+      - ongrid_net
+
+volumes:
+  mysql_data_dev:
+  prometheus_data_dev:
+  grafana_data_dev:
+  qdrant_data_dev:
+  loki_data_dev:
+  tempo_data_dev:
+
+networks:
+  ongrid_net:
+    driver: bridge
